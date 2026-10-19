@@ -1,0 +1,82 @@
+name: Monitor BORDO
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL alternativa (apenas para teste do alerta)'
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verifica a saúde do BORDO (3 tentativas)
+        id: chk
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          if [ -z "$URL" ]; then URL="https://edb-production.up.railway.app/health"; fi
+          STATUS=down
+          for i in 1 2 3; do
+            R=$(curl -s -m 20 "$URL" || true)
+            if echo "$R" | grep -q '"status":"ok"'; then STATUS=up; break; fi
+            sleep 20
+          done
+          PREV=$(cat estado.txt 2>/dev/null || echo up)
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
+          echo "Estado atual: $STATUS (anterior: $PREV)"
+
+      - name: Registra mudança de estado
+        if: steps.chk.outputs.status != steps.chk.outputs.prev
+        run: |
+          echo "${{ steps.chk.outputs.status }}" > estado.txt
+          git config user.name "bordo-monitor"
+          git config user.email "monitor@users.noreply.github.com"
+          git add estado.txt
+          git commit -m "estado: ${{ steps.chk.outputs.status }} ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+          git push
+
+      - name: Alerta por e-mail (Resend)
+        if: steps.chk.outputs.status != steps.chk.outputs.prev
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        run: |
+          AGORA=$(TZ=America/Boa_Vista date '+%d/%m/%Y %H:%M (Boa Vista)')
+          if [ "${{ steps.chk.outputs.status }}" = "down" ]; then
+            ASSUNTO="🔴 BORDO FORA DO AR — $AGORA"
+            CORPO="O monitor detectou que o BORDO (edb-production.up.railway.app) NAO esta respondendo (3 tentativas em ~1 minuto).\n\nVerifique:\n1. https://railway.com — fatura/credito e status dos servicos (causa mais comum)\n2. Logs do servico edb\n\nVoce recebera outro e-mail quando o sistema voltar.\n— Monitor automatico (github.com/kjsysten/bordo-status)"
+          else
+            ASSUNTO="🟢 BORDO voltou ao ar — $AGORA"
+            CORPO="O BORDO voltou a responder normalmente.\n— Monitor automatico (github.com/kjsysten/bordo-status)"
+          fi
+          curl -s -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"from\":\"Monitor BORDO <onboarding@resend.dev>\",\"to\":[\"kelvinjordao@hotmail.com\"],\"subject\":\"$ASSUNTO\",\"text\":\"$CORPO\"}"
+
+      - name: Issue de registro (caiu) / fecha (voltou)
+        if: steps.chk.outputs.status != steps.chk.outputs.prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.chk.outputs.status }}" = "down" ]; then
+            gh issue create --title "🔴 BORDO fora do ar — $(date -u '+%Y-%m-%d %H:%M UTC')" \
+              --body "Detectado pelo monitor automático. Verifique o Railway (fatura/serviços)." || true
+          else
+            N=$(gh issue list --state open --limit 1 --json number --jq '.[0].number' || true)
+            if [ -n "$N" ] && [ "$N" != "null" ]; then
+              gh issue close "$N" --comment "🟢 Sistema voltou ao ar em $(date -u '+%Y-%m-%d %H:%M UTC')." || true
+            fi
+          fi
